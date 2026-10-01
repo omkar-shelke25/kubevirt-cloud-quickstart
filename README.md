@@ -116,7 +116,8 @@ gcloud container node-pools create kubevirt-pool \
 
 ### EKS
 
-EKS has no nested virtualization flag, so it is set through an EC2 launch template.
+> [!WARNING]
+> Neither `eksctl` nor the EKS node group API has a nested virtualization flag. It can only be enabled through `CpuOptions.NestedVirtualization` in an EC2 launch template, and only on the C8i, M8i, and R8i instance families. A node group created without this launch template cannot be changed later. Create a new node group with it instead.
 
 Create the launch template and copy the ID it prints:
 
