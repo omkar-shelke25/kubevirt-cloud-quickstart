@@ -126,7 +126,7 @@ When `spec.infra.nodePlacement` is set, the operator uses it in place of the con
 
 - `kubectl`
 - The CLI for your cloud: `gcloud`, `aws` with `eksctl`, or `az`
-- `virtctl` (installed in [Step 4](#step-4-run-a-test-vm))
+- `virtctl` (installed in [Step 4](#step-4-install-virtctl))
 
 ## Step 1: Create a cluster
 
@@ -256,28 +256,96 @@ kubectl get nodes -l kubevirt=true -o custom-columns=NAME:.metadata.name,KVM:.st
 
 A value such as `1k` in the `KVM` column means hardware virtualization works. An empty value means nested virtualization is not active on that node.
 
-## Step 4: Run a test VM
+## Step 4: Install virtctl
 
-Install `virtctl`, using the same version as the cluster:
+`virtctl` is the KubeVirt command line client. `kubectl` can create and delete VMs, but you need `virtctl` to start and stop them, open the serial console or VNC, SSH into them, and expose their ports.
+
+Install the version that matches the cluster. A mismatched client can fail against the cluster API.
+
+### Linux and macOS
 
 ```bash
 VERSION=$(kubectl get kubevirt.kubevirt.io/kubevirt -n kubevirt -o=jsonpath="{.status.observedKubeVirtVersion}")
-ARCH=$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/')
+ARCH=$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+echo "${VERSION} ${ARCH}"
 curl -L -o virtctl https://github.com/kubevirt/kubevirt/releases/download/${VERSION}/virtctl-${VERSION}-${ARCH}
 sudo install -m 0755 virtctl /usr/local/bin
+rm virtctl
 ```
 
-Start the VM and open its console:
+The `echo` line should print something like `v1.9.0 linux-amd64`. If `VERSION` is empty, KubeVirt is not installed yet. Finish [Step 2](#step-2-install-kubevirt) first.
+
+> [!NOTE]
+> Release binaries exist for `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, and `windows-amd64.exe`.
+
+### Windows
+
+Download `virtctl-<version>-windows-amd64.exe` from the [KubeVirt releases page](https://github.com/kubevirt/kubevirt/releases), rename it to `virtctl.exe`, and place it in a folder on your `PATH`.
+
+### As a kubectl plugin (krew)
+
+If you use [krew](https://krew.sigs.k8s.io/):
+
+```bash
+kubectl krew install virt
+```
+
+With the plugin, every `virtctl <command>` in this README becomes `kubectl virt <command>`.
+
+> [!WARNING]
+> The krew plugin installs the latest `virtctl`, not the version of your cluster. Use the binary install above if your cluster runs an older KubeVirt release.
+
+### Verify
+
+```bash
+virtctl version
+```
+
+The output shows both the client version and the server version. They should match.
+
+## Step 5: Run a test VM
+
+Create the VM:
 
 ```bash
 kubectl apply -f manifests/testvm.yaml
+```
+
+`testvm.yaml` uses `runStrategy: Always`, so the VM starts as soon as it is created. Wait until it reports `Running`:
+
+```bash
+kubectl get vm testvm
 kubectl get vmi testvm
+```
+
+A `VirtualMachine` (`vm`) is the definition. A `VirtualMachineInstance` (`vmi`) exists only while the VM is running.
+
+Open the serial console:
+
+```bash
 virtctl console testvm
 ```
 
-Press `Ctrl+]` to leave the console.
+Log in with user `cirros` and password `gocubsgo`. Press `Ctrl+]` to leave the console.
 
-Stop and remove the VM:
+### Common virtctl commands
+
+| Task | Command |
+|---|---|
+| Start a stopped VM | `virtctl start testvm` |
+| Stop a running VM | `virtctl stop testvm` |
+| Restart a VM | `virtctl restart testvm` |
+| Pause and resume a VM | `virtctl pause vm testvm` / `virtctl unpause vm testvm` |
+| Serial console | `virtctl console testvm` |
+| Graphical console (needs `remote-viewer` installed locally) | `virtctl vnc testvm` |
+| SSH into the VM (needs an SSH key in the guest) | `virtctl ssh cirros@vm/testvm` |
+| Expose SSH as a Kubernetes Service | `virtctl expose vm testvm --name testvm-ssh --port 22 --type ClusterIP` |
+| Show client and server versions | `virtctl version` |
+
+> [!NOTE]
+> `virtctl stop` changes the VM's `runStrategy` to `Halted`. The VM stays stopped until you run `virtctl start`, even if its node restarts.
+
+### Remove the VM
 
 ```bash
 kubectl delete -f manifests/testvm.yaml
