@@ -35,7 +35,51 @@ There are two places that require control plane nodes:
 | `virt-operator` | `kubevirt-operator.yaml`, Deployment `spec.template.spec.affinity` | Required node affinity on `node-role.kubernetes.io/control-plane` or `node-role.kubernetes.io/master` |
 | `virt-api`, `virt-controller` | Not in any YAML. The operator creates them at runtime. | Same required affinity, applied whenever `spec.infra.nodePlacement` is empty in the KubeVirt CR |
 
-GKE, EKS, and AKS nodes never carry these labels, so the pods cannot be scheduled.
+On kubeadm or on-prem clusters this works, because the control plane runs on nodes inside the cluster and those nodes carry the `node-role.kubernetes.io/control-plane` label.
+
+On managed Kubernetes it fails, because the cloud provider runs the control plane outside your cluster. `kubectl get nodes` lists only worker nodes, and none of them carry a control plane label. Every node shows `<none>` (or a provider role) in the `ROLES` column:
+
+```
+$ kubectl get nodes
+NAME                                          STATUS   ROLES    AGE   VERSION
+gke-kubevirt-lab-default-pool-3f1c2a9b-x7kq   Ready    <none>   12m   v1.33.4-gke.1245000
+```
+
+The result is that `virt-operator` stays `Pending` with an event like this:
+
+```
+0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.
+```
+
+### Each cloud labels its nodes differently
+
+Every provider adds its own labels to nodes, and none of them mean "control plane":
+
+| Cloud | Node pool label | Other provider labels |
+|---|---|---|
+| GKE | `cloud.google.com/gke-nodepool=<pool>` | `cloud.google.com/machine-family`, `cloud.google.com/gke-os-distribution` |
+| EKS | `eks.amazonaws.com/nodegroup=<nodegroup>` | `eks.amazonaws.com/capacityType`, `alpha.eksctl.io/nodegroup-name` |
+| AKS | `kubernetes.azure.com/agentpool=<pool>` | `kubernetes.azure.com/mode`, `kubernetes.azure.com/os-sku` |
+
+All three also set the standard Kubernetes labels such as `kubernetes.io/os`, `node.kubernetes.io/instance-type`, and `topology.kubernetes.io/zone`.
+
+To see the labels on your own nodes, run:
+
+```bash
+kubectl get nodes --show-labels
+```
+
+### Why this repo uses a custom `kubevirt=true` label
+
+- **One set of manifests for every cloud.** Provider labels have different keys on each cloud, so a manifest built on `cloud.google.com/gke-nodepool` would only work on GKE. `kubevirt=true` is the same everywhere.
+- **It marks the nodes that can run VMs.** Only nodes created with nested virtualization get the label, so KubeVirt components and VMs never land on a node without `/dev/kvm`.
+- **It is set on the node pool, not with `kubectl label`.** Managed services replace nodes during upgrades, auto-repair, and autoscaling. A label added with `kubectl label node` is lost when that node is replaced. A label set with `--node-labels` (GKE), `labels:` in eksctl (EKS), or `--nodepool-labels` / `--labels` (AKS) is applied to every new node automatically.
+
+> [!WARNING]
+> Some guides work around this by adding a fake control plane label with `kubectl label node <node> node-role.kubernetes.io/control-plane=`. Avoid this. The node is not a control plane node, other tools may treat it as one, and the label disappears as soon as the cloud replaces the node.
+
+> [!TIP]
+> To use a provider label instead of `kubevirt=true`, change the `nodeSelector` key and value in both `kubevirt-operator.yaml` and `kubevirt-cr.yaml`. For example, use `cloud.google.com/gke-nodepool: kubevirt-pool` on GKE.
 
 ### What was changed
 
