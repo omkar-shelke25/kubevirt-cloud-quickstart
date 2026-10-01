@@ -1,1 +1,15 @@
-
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: kubevirt-lab
+  region: us-east-1
+managedNodeGroups:
+- name: kubevirt
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  labels:
+    kubevirt: "true"
+  launchTemplate:
+    id: lt-REPLACE_ME
+    version: "1"
