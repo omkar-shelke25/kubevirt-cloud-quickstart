@@ -9,6 +9,8 @@ The upstream KubeVirt install manifests only schedule their core components on c
 ```
 .
 ├── README.md
+├── docs/
+│   └── virtctl-tutorial.md      # hands-on tour of every common virtctl command
 ├── manifests/
 │   ├── kubevirt-operator.yaml   # upstream v1.9.0, virt-operator placement patched
 │   ├── kubevirt-cr.yaml         # KubeVirt CR with infra and workload placement
@@ -134,6 +136,14 @@ Pick one cloud. Every example creates a single node cluster labeled `kubevirt=tr
 
 ### GKE
 
+Before creating the cluster, check that your project allows nested virtualization:
+
+```bash
+gcloud resource-manager org-policies describe compute.disableNestedVirtualization --effective
+```
+
+If the output shows `enforced: true`, nested virtualization is blocked for the whole project and nodes will have no `/dev/kvm`. You can still run VMs, but only with [emulation](#no-hardware-virtualization-use-emulation).
+
 ```bash
 gcloud container clusters create kubevirt-lab \
   --zone=us-central1-a \
@@ -145,6 +155,9 @@ gcloud container clusters create kubevirt-lab \
 ```
 
 `gcloud` writes the kubeconfig automatically.
+
+> [!WARNING]
+> If a zone has no free `n2` capacity, the node never starts. The cluster stays `PROVISIONING` for about 35 minutes and then fails with `GCE_STOCKOUT` / `ZONE_RESOURCE_POOL_EXHAUSTED`. A running create cannot be cancelled, so check for errors while it runs with `gcloud compute instance-groups managed list-errors <group-name> --zone=<zone>`. If you see a stockout, start a new cluster with a different name in another zone right away, and delete the failed one once its create operation ends.
 
 To add KubeVirt to an existing GKE cluster, create a new node pool instead:
 
@@ -254,7 +267,7 @@ Check that the node has KVM available:
 kubectl get nodes -l kubevirt=true -o custom-columns=NAME:.metadata.name,KVM:.status.allocatable.devices\.kubevirt\.io/kvm
 ```
 
-A value such as `1k` in the `KVM` column means hardware virtualization works. An empty value means nested virtualization is not active on that node.
+A value such as `1k` in the `KVM` column means hardware virtualization works. An empty value or `0` means the node has no `/dev/kvm`. VMs will stay `Pending` until you fix nested virtualization or turn on [emulation](#no-hardware-virtualization-use-emulation).
 
 ## Step 4: Install virtctl
 
@@ -351,17 +364,157 @@ Log in with user `cirros` and password `gocubsgo`. Press `Ctrl+]` to leave the c
 kubectl delete -f manifests/testvm.yaml
 ```
 
+To try every common `virtctl` command (lifecycle, console, SSH, file copy, port forwarding, and guest agent queries), follow [Exploring virtctl](docs/virtctl-tutorial.md).
+
+## Optional: Install CDI
+
+CDI (Containerized Data Importer) adds persistent disks to KubeVirt. It imports VM images into PersistentVolumeClaims and manages `DataVolume` objects. You need it for:
+
+- VMs whose disk survives a restart (a containerdisk is reset on every start)
+- `virtctl create vm --volume-import`, `virtctl image-upload`, and VM cloning and snapshots
+- Disk and volume pages in web UIs such as [KubeVirt Manager](#optional-web-ui-with-kubevirt-manager), which shows `CDI (Containerized Data Importer) not found!` without it
+
+Unlike KubeVirt, CDI's manifests need no changes on managed Kubernetes. Its operator only uses a `kubernetes.io/os: linux` node selector and does not require control plane nodes.
+
+### Check the StorageClass
+
+CDI creates PVCs, so the cluster needs a default StorageClass that allows volume expansion:
+
+```bash
+kubectl get storageclass
+```
+
+Look for `(default)` next to one class and `true` in the `ALLOWVOLUMEEXPANSION` column.
+
+| Cloud | Default StorageClass |
+|---|---|
+| GKE | `standard-rwo` (Persistent Disk CSI driver, enabled by default) |
+| AKS | `managed-csi` (Azure Disk CSI driver, enabled by default) |
+| EKS | None that works out of the box. Install the Amazon EBS CSI driver add-on and mark a `gp3` StorageClass as default first. |
+
+### Install
+
+```bash
+kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/v1.66.1/cdi-operator.yaml
+kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/v1.66.1/cdi-cr.yaml
+kubectl wait cdi cdi --for condition=Available --timeout=10m
+```
+
+### Verify
+
+```bash
+kubectl get pods -n cdi
+```
+
+You should see `cdi-operator`, `cdi-apiserver`, `cdi-deployment`, and `cdi-uploadproxy` all `Running`.
+
+> [!NOTE]
+> The default `cdi-cr.yaml` already enables the `HonorWaitForFirstConsumer` feature gate. With it, a disk is created in the same zone as the node that runs the VM.
+
+## Optional: Web UI with KubeVirt Manager
+
+[KubeVirt Manager](https://kubevirt-manager.io/) is an open-source web UI for KubeVirt. It lists and controls VMs and opens a VNC console in the browser through noVNC.
+
+Requirements:
+
+- KubeVirt from this repo (its `ExpandDisks` feature gate is GA in v1.9.0, so nothing to enable)
+- [CDI](#optional-install-cdi), for the disk and volume pages. The VM list, power actions, and console work without it.
+
+### Install
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubevirt-manager/kubevirt-manager/main/kubernetes/bundled.yaml
+kubectl -n kubevirt-manager rollout status deploy/kubevirt-manager
+```
+
+### Open the UI
+
+```bash
+kubectl -n kubevirt-manager port-forward svc/kubevirt-manager 8080:8080
+```
+
+Open `http://localhost:8080`. To reach it from another machine (for example a cloud playground that exposes ports through its own UI), add `--address 0.0.0.0` to the port-forward.
+
+> [!WARNING]
+> KubeVirt Manager has no login by default, and its ClusterRole can manage resources across the whole cluster. Anyone who can reach the UI controls your VMs. Keep it behind `port-forward`. Do not expose it with a NodePort or a public LoadBalancer.
+
+### Graphical desktop in the VNC console
+
+The VNC console shows the VM's own screen. Cloud images such as Ubuntu have no desktop, so you see a text login. To get a graphical login, the guest needs a desktop and a display manager, for example with cloud-init:
+
+```yaml
+runcmd:
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xfce4 xfce4-terminal dbus-x11 lightdm lightdm-gtk-greeter
+  - systemctl start lightdm
+```
+
 ## No hardware virtualization: use emulation
 
-If your nodes cannot expose `/dev/kvm` (for example GKE `e2` or EKS `t3`), turn on software emulation after the CR is applied:
+KubeVirt normally runs VMs with KVM, which needs `/dev/kvm` on the node. When a node has no KVM, KubeVirt can run VMs with QEMU software emulation instead.
+
+### When you need it
+
+| Situation | Example |
+|---|---|
+| The machine type has no nested virtualization | GKE `e2`, EKS `t3`, Graviton |
+| An organization policy blocks nested virtualization | GCP `constraints/compute.disableNestedVirtualization` enforced, common in training and sandbox lab accounts |
+| The hypervisor under your nodes does not pass through VMX/SVM | Some on-prem VMs and nested lab setups |
+
+### How to detect it
+
+| Check | Command | No KVM looks like |
+|---|---|---|
+| VM pod events | `kubectl describe pod -l kubevirt.io=virt-launcher` | `Insufficient devices.kubevirt.io/kvm` |
+| Node resources | `kubectl get nodes -o custom-columns=NAME:.metadata.name,KVM:.status.allocatable.devices\.kubevirt\.io/kvm` | `0` or empty |
+| virt-handler logs | `kubectl -n kubevirt logs ds/virt-handler \| grep -i kvm` | `open /dev/kvm: no such file or directory` |
+| GCP org policy | `gcloud resource-manager org-policies describe compute.disableNestedVirtualization --effective` | `enforced: true` |
+
+> [!IMPORTANT]
+> On GCP, an enforced org policy wins over `--enable-nested-virtualization`. GKE accepts the flag and shows it in the node pool config, but GCP hides the VMX CPU flag from the node, so `/dev/kvm` never appears. Nothing fails at create time. You only notice when VMs stay `Pending`.
+
+### Turn it on
 
 ```bash
 kubectl -n kubevirt patch kubevirt kubevirt --type=merge \
   --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
 ```
 
+Confirm it is set:
+
+```bash
+kubectl -n kubevirt get kubevirt kubevirt -o jsonpath='{.spec.configuration.developerConfiguration.useEmulation}{"\n"}'
+```
+
+This prints `true`.
+
+VMs that were already `Pending` keep their old pod, which still asks for KVM. Restart each one so its pod is recreated without the KVM request:
+
+```bash
+virtctl restart <vm-name>
+```
+
+### What to expect
+
 > [!WARNING]
-> Emulation runs the whole guest in software. VMs boot and run, but much slower. Use it for learning only.
+> Emulation runs every guest CPU instruction in software. Use it for learning and testing only.
+
+| Task (Ubuntu 24.04, 1 vCPU, n2-standard-2 node) | Approximate time under emulation |
+|---|---|
+| Boot to login prompt | 3 minutes |
+| Cloud-init `apt-get update` | 1 to 2 minutes |
+| Install XFCE and xrdp with cloud-init | 10 minutes |
+| Cloud-init finished, ready to log in | About 14 minutes after start |
+
+Expect a slow desktop, slow package installs, and short console timeouts. Give `kubectl wait` and `virtctl console --timeout` longer timeouts than usual.
+
+### Turn it off
+
+When you move to nodes that have KVM, set `useEmulation` back to `false` and restart your VMs:
+
+```bash
+kubectl -n kubevirt patch kubevirt kubevirt --type=merge \
+  --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":false}}}}'
+```
 
 ## Troubleshooting
 
@@ -371,9 +524,21 @@ kubectl -n kubevirt patch kubevirt kubevirt --type=merge \
 | `virt-api` or `virt-controller` is `Pending` | The CR was applied without `spec.infra.nodePlacement` | Apply `manifests/kubevirt-cr.yaml` from this repo |
 | `KVM` column is empty in Step 3 | Nested virtualization is off on the node | Recreate the node or node pool with a supported type, or use emulation |
 | VMI events show `Insufficient devices.kubevirt.io/kvm` | Same as above | Same as above |
+| `KVM` is `0` even though the node pool has `enableNestedVirtualization: true` | A GCP org policy blocks nested virtualization | Check `compute.disableNestedVirtualization`. If enforced, use [emulation](#no-hardware-virtualization-use-emulation) or another project |
+| VM still `Pending` after turning on emulation | Its pod was created before the change and still requests KVM | `virtctl restart <vm-name>` |
+| GKE cluster stuck in `PROVISIONING`, then `GCE_STOCKOUT` | No free capacity for the machine type in that zone | Create the cluster in another zone (see the warning in [GKE](#gke)) |
+| Web UI shows `CDI (Containerized Data Importer) not found!` | CDI is not installed | [Install CDI](#optional-install-cdi) |
 | `kubectl apply` of a VM times out on a webhook (private GKE cluster) | The control plane cannot reach `virt-api` on port 8443 | Add a firewall rule that allows the control plane CIDR to reach the nodes on `tcp:8443` |
 
 ## Clean up
+
+Remove the optional add-ons first, if you installed them:
+
+```bash
+kubectl delete -f https://raw.githubusercontent.com/kubevirt-manager/kubevirt-manager/main/kubernetes/bundled.yaml
+kubectl delete cdi cdi
+kubectl delete -f https://github.com/kubevirt/containerized-data-importer/releases/download/v1.66.1/cdi-operator.yaml
+```
 
 GKE:
 
@@ -404,6 +569,8 @@ The manifests are pinned to v1.9.0. To move to a newer release:
 
 ## References
 
+- [CDI (Containerized Data Importer)](https://github.com/kubevirt/containerized-data-importer)
+- [KubeVirt Manager](https://github.com/kubevirt-manager/kubevirt-manager)
 - [KubeVirt quickstart with cloud providers](https://kubevirt.io/quickstart_cloud/)
 - [GKE: Use nested VMs with Standard clusters](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/nested-virtualization)
 - [EC2: Use nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
