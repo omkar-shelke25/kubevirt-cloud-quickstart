@@ -11,6 +11,9 @@ The upstream KubeVirt install manifests only schedule their core components on c
 ├── README.md
 ├── docs/
 │   └── virtctl-tutorial.md      # hands-on tour of every common virtctl command
+├── iximiuz-setup-script/
+│   ├── README.md                # KubeVirt on iximiuz Labs k8s-omni, step by step
+│   └── setup-kubevirt.sh        # runs Steps 2-5 on any cluster, turns on emulation if needed
 ├── manifests/
 │   ├── kubevirt-operator.yaml   # upstream v1.9.0, virt-operator placement patched
 │   ├── kubevirt-cr.yaml         # KubeVirt CR with infra and workload placement
@@ -243,6 +246,44 @@ ls -l /dev/kvm
 ```
 
 If `/dev/kvm` is missing, enable nested virtualization in your hypervisor or cloud, or use [emulation](#no-hardware-virtualization-use-emulation).
+
+## Shortcut: setup script
+
+Once a cluster exists and `kubectl` points at it, `iximiuz-setup-script/setup-kubevirt.sh` runs the rest of this guide for you. It was written for iximiuz Labs `k8s-omni` playgrounds (see [its README](iximiuz-setup-script/README.md)), and also works on GKE, EKS, AKS, kubeadm, and k3s.
+
+```bash
+./iximiuz-setup-script/setup-kubevirt.sh
+```
+
+It runs seven named tasks, and each one checks the current state first, so it is safe to run again:
+
+| Task | What it does |
+|---|---|
+| `wait_for_nodes` | Waits until every node is `Ready` |
+| `label_nodes` | Labels worker nodes `kubevirt=true` (every node if there are no workers) |
+| `install_operator` | Applies `manifests/kubevirt-operator.yaml` and waits for `virt-operator` |
+| `install_kubevirt` | Applies `manifests/kubevirt-cr.yaml` and waits until KubeVirt is `Available` |
+| `configure_emulation` | Turns on `useEmulation` if any labeled node has no `/dev/kvm` |
+| `install_virtctl` | Installs the `virtctl` version that matches the cluster |
+| `create_test_vm` | Optional. Starts `testvm` and waits until it is `Ready` |
+
+Optional settings:
+
+| Variable | Example | Effect |
+|---|---|---|
+| `KUBEVIRT_NODES` | `KUBEVIRT_NODES="node-01 node-02"` | Label these nodes instead of auto-detecting workers |
+| `FORCE_EMULATION` | `FORCE_EMULATION=true` | Turn on emulation even when KVM is present |
+| `CREATE_TEST_VM` | `CREATE_TEST_VM=true` | Also run `create_test_vm` |
+| `WAIT_TIMEOUT` | `WAIT_TIMEOUT=1200` | Seconds to wait for KubeVirt to become `Available` (default `900`) |
+
+For example, to also start the test VM:
+
+```bash
+CREATE_TEST_VM=true ./iximiuz-setup-script/setup-kubevirt.sh
+```
+
+> [!NOTE]
+> The script uses `kubectl apply --server-side`, not `kubectl create`. The KubeVirt CRDs are too large for client-side apply, and server-side apply can run again without `AlreadyExists` errors.
 
 ## Step 2: Install KubeVirt
 
