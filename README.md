@@ -255,11 +255,12 @@ Once a cluster exists and `kubectl` points at it, `iximiuz-setup-script/setup-ku
 ./iximiuz-setup-script/setup-kubevirt.sh
 ```
 
-It runs seven named tasks, and each one checks the current state first, so it is safe to run again:
+It runs eight named tasks, and each one checks the current state first, so it is safe to run again:
 
 | Task | What it does |
 |---|---|
 | `wait_for_nodes` | Waits until every node is `Ready` |
+| `disable_selinuxfs` | Unmounts `/sys/fs/selinux` on nodes where it is mounted but no SELinux policy is loaded (see [Troubleshooting](#troubleshooting)) |
 | `label_nodes` | Labels worker nodes `kubevirt=true` (every node if there are no workers) |
 | `install_operator` | Applies `manifests/kubevirt-operator.yaml` and waits for `virt-operator` |
 | `install_kubevirt` | Applies `manifests/kubevirt-cr.yaml` and waits until KubeVirt is `Available` |
@@ -275,6 +276,8 @@ Optional settings:
 | `FORCE_EMULATION` | `FORCE_EMULATION=true` | Turn on emulation even when KVM is present |
 | `CREATE_TEST_VM` | `CREATE_TEST_VM=true` | Also run `create_test_vm` |
 | `WAIT_TIMEOUT` | `WAIT_TIMEOUT=1200` | Seconds to wait for KubeVirt to become `Available` (default `900`) |
+| `SKIP_SELINUX_FIX` | `SKIP_SELINUX_FIX=true` | Skip `disable_selinuxfs` |
+| `HELPER_IMAGE` | `HELPER_IMAGE=busybox:1.36` | Image for the short-lived node pods that `disable_selinuxfs` starts |
 
 For example, to also start the test VM:
 
@@ -569,6 +572,7 @@ kubectl -n kubevirt patch kubevirt kubevirt --type=merge \
 | VM still `Pending` after turning on emulation | Its pod was created before the change and still requests KVM | `virtctl restart <vm-name>` |
 | GKE cluster stuck in `PROVISIONING`, then `GCE_STOCKOUT` | No free capacity for the machine type in that zone | Create the cluster in another zone (see the warning in [GKE](#gke)) |
 | Web UI shows `CDI (Containerized Data Importer) not found!` | CDI is not installed | [Install CDI](#optional-install-cdi) |
+| VM starts, then crashes every few seconds and ends in `CrashLoopBackOff`. VMI events show `could not retrieve pid ... selinux label: getxattr /proc/.../attr/current: operation not supported` | The node mounts `selinuxfs` but has no SELinux policy loaded (seen on iximiuz Labs). KubeVirt treats SELinux as on and fails to label the VM's tap device. | Run `sudo umount /sys/fs/selinux` on each node, or run the setup script, which does it in `disable_selinuxfs` |
 | `kubectl apply` of a VM times out on a webhook (private GKE cluster) | The control plane cannot reach `virt-api` on port 8443 | Add a firewall rule that allows the control plane CIDR to reach the nodes on `tcp:8443` |
 
 ## Clean up
