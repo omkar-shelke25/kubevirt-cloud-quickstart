@@ -1,4 +1,3 @@
-
 # KubeVirt on iximiuz Labs
 
 Run KubeVirt virtual machines on the iximiuz Labs [`k8s-omni`](https://labs.iximiuz.com/playgrounds/k8s-omni) playground with one script.
@@ -22,6 +21,31 @@ Playground VMs run on Firecracker, which does not pass Intel VMX or AMD SVM to t
 
 > [!IMPORTANT]
 > iximiuz Labs used to offer a `cloud-hypervisor` backend with nested virtualization. It has been disabled since July 13, 2026, after KVM guest-to-host escape vulnerabilities. A custom rootfs cannot change this, because CPU features come from the hypervisor, not the disk image. See [Nested Virtualization](https://labs.iximiuz.com/docs/playground-recipes/nested-virtualization) for the current status.
+
+### SELinux on iximiuz nodes
+
+The playground kernel has SELinux built in and mounts `/sys/fs/selinux`, but no SELinux policy is loaded. KubeVirt treats SELinux as active whenever `/sys/fs/selinux/enforce` exists. When a VM starts, KubeVirt tries to read the SELinux label of the VM's QEMU process so it can label the VM's network tap device. With no policy loaded, the kernel refuses that read, network setup fails, and the VM crashes about 3 seconds after starting:
+
+```
+failed to configure vmi network: setup failed, err: Critical network error:
+could not retrieve pid 22479 selinux label: getxattr /proc/22479/attr/current: operation not supported
+```
+
+KubeVirt keeps restarting the VM, and it ends in `CrashLoopBackOff`. This happens to every VM, whatever the image.
+
+The script's `disable_selinuxfs` task fixes this by unmounting `/sys/fs/selinux` on each node. KubeVirt then sees SELinux as disabled and skips the label step. It is safe here, because no policy is loaded and SELinux enforces nothing either way.
+
+> [!NOTE]
+> The task only unmounts `selinuxfs` when no policy is loaded (PID 1 still has the `kernel` label). Nodes with a real SELinux policy, such as Fedora or RHEL, are left alone.
+
+> [!WARNING]
+> The unmount does not survive a node restart. If VMs start crashing again, run the script again.
+
+To do it by hand instead, run this on `cplane-01`, `node-01`, and `node-02`:
+
+```bash
+sudo umount /sys/fs/selinux
+```
 
 ### The k8s-omni machines
 
@@ -74,11 +98,12 @@ All three nodes should be `Ready`, with `cplane-01` showing `control-plane` unde
 CREATE_TEST_VM=true ./iximiuz-setup-script/setup-kubevirt.sh
 ```
 
-The script runs seven tasks in order. Each one checks the current state first, so you can run it again if a step fails.
+The script runs eight tasks in order. Each one checks the current state first, so you can run it again if a step fails.
 
 | Task | What happens on k8s-omni |
 |---|---|
 | `wait_for_nodes` | Waits until all nodes are `Ready` |
+| `disable_selinuxfs` | Unmounts `/sys/fs/selinux` on every node. Without this, every VM crashes a few seconds after starting (see [SELinux on iximiuz nodes](#selinux-on-iximiuz-nodes)). |
 | `label_nodes` | Labels `node-01` and `node-02` with `kubevirt=true`. `cplane-01` is left out, so KubeVirt doesn't compete with the control plane for memory. |
 | `install_operator` | Applies `manifests/kubevirt-operator.yaml` and waits for `virt-operator` |
 | `install_kubevirt` | Applies `manifests/kubevirt-cr.yaml` and waits until KubeVirt is `Available` |
@@ -94,6 +119,8 @@ Optional settings:
 | `KUBEVIRT_NODES` | Auto-detected workers | A space-separated list of nodes to label instead |
 | `FORCE_EMULATION` | `false` | `true` turns on emulation without checking for KVM |
 | `WAIT_TIMEOUT` | `900` | Seconds to wait for KubeVirt to become `Available` |
+| `SKIP_SELINUX_FIX` | `false` | `true` skips `disable_selinuxfs` |
+| `HELPER_IMAGE` | `busybox:1.36` | Image for the short-lived node pods used by `disable_selinuxfs` |
 
 ## 5. Verify
 
@@ -202,6 +229,7 @@ The disk and volume pages need CDI. See [Optional: Install CDI](../README.md#opt
 | VM pod events show `Insufficient devices.kubevirt.io/kvm` | Emulation was not on when the VM was created | Run the script again (it turns emulation on), then `virtctl restart <vm-name>` |
 | VM pod events show `Insufficient memory` | The VM's memory plus about 250 MiB of overhead doesn't fit on a worker | Use less guest memory, or delete other VMs |
 | VM boots very slowly | Expected under emulation | Wait. Allow about 3 minutes to boot. |
+| VM crashes a few seconds after start, `CrashLoopBackOff`, event `could not retrieve pid ... selinux label` | `selinuxfs` is mounted again, for example after a node restart | Run the script again, or `sudo umount /sys/fs/selinux` on each node |
 | `virtctl: command not found` | The `install_virtctl` task didn't run or failed | Run the script again |
 
 ## Clean up
