@@ -7,12 +7,13 @@
 #
 # What it does, as separate named tasks:
 #   1. wait_for_nodes      wait until every node is Ready
-#   2. label_nodes         label worker nodes kubevirt=true (all nodes if there are no workers)
-#   3. install_operator    apply manifests/kubevirt-operator.yaml and wait for virt-operator
-#   4. install_kubevirt    apply manifests/kubevirt-cr.yaml and wait until KubeVirt is Available
-#   5. configure_emulation turn on useEmulation when no labeled node exposes /dev/kvm
-#   6. install_virtctl     install the virtctl version that matches the cluster
-#   7. create_test_vm      optional, start manifests/testvm.yaml and wait until it is Ready
+#   2. disable_selinuxfs   unmount /sys/fs/selinux on nodes where SELinux has no policy loaded
+#   3. label_nodes         label worker nodes kubevirt=true (all nodes if there are no workers)
+#   4. install_operator    apply manifests/kubevirt-operator.yaml and wait for virt-operator
+#   5. install_kubevirt    apply manifests/kubevirt-cr.yaml and wait until KubeVirt is Available
+#   6. configure_emulation turn on useEmulation when no labeled node exposes /dev/kvm
+#   7. install_virtctl     install the virtctl version that matches the cluster
+#   8. create_test_vm      optional, start manifests/testvm.yaml and wait until it is Ready
 #
 # Safe to run again: every task checks the current state first.
 #
@@ -22,7 +23,8 @@
 # Optional environment variables:
 #   KUBEVIRT_NODES="node-01 node-02"   label these nodes instead of auto-detecting workers
 #   FORCE_EMULATION=true               turn on emulation even if KVM is present
-#   CREATE_TEST_VM=true                also run task 7
+#   CREATE_TEST_VM=true                also run task 8
+#   SKIP_SELINUX_FIX=true              skip task 2
 #   WAIT_TIMEOUT=900                   seconds to wait for KubeVirt to become Available
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +33,8 @@ MANIFEST_DIR="${SCRIPT_DIR}/../manifests"
 KUBEVIRT_NODES="${KUBEVIRT_NODES:-}"
 FORCE_EMULATION="${FORCE_EMULATION:-false}"
 CREATE_TEST_VM="${CREATE_TEST_VM:-false}"
+SKIP_SELINUX_FIX="${SKIP_SELINUX_FIX:-false}"
+HELPER_IMAGE="${HELPER_IMAGE:-busybox:1.36}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 
 NODE_LABEL_KEY="kubevirt"
@@ -71,13 +75,101 @@ all_nodes_ready() {
 }
 
 task_wait_for_nodes() {
-  log "Task 1/7: wait_for_nodes"
+  log "Task 1/8: wait_for_nodes"
   wait_until 300 all_nodes_ready || fail "not all nodes became Ready within 300s"
   kubectl get nodes
 }
 
+# Runs on one node, inside the host mount namespace.
+# Unmounts selinuxfs only when it is mounted AND no SELinux policy is loaded
+# (PID 1 still has the "kernel" label). Nodes with a real SELinux policy are left alone.
+# shellcheck disable=SC2016  # expanded on the node, not here
+SELINUX_FIX_CMD='if [ ! -f /sys/fs/selinux/enforce ]; then echo "not-mounted"; elif [ "$(tr -d "\0" < /proc/1/attr/current)" != "kernel" ]; then echo "policy-loaded"; else umount /sys/fs/selinux && echo "unmounted"; fi'
+
+# Starts a short-lived privileged pod on the node and prints its result.
+fix_selinuxfs_on_node() {
+  local node="$1"
+  local pod="kubevirt-selinux-fix-${node}"
+  local result
+
+  kubectl -n kube-system delete pod "$pod" --ignore-not-found --wait=true >/dev/null 2>&1
+
+  kubectl -n kube-system apply -f - >/dev/null <<EOF || return 1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  labels:
+    app: kubevirt-selinux-fix
+spec:
+  nodeName: ${node}
+  hostPID: true
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: fix
+    image: ${HELPER_IMAGE}
+    command:
+    - chroot
+    - /host
+    - nsenter
+    - -t
+    - "1"
+    - -m
+    - --
+    - sh
+    - -c
+    - |
+      ${SELINUX_FIX_CMD}
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: host
+      mountPath: /host
+  volumes:
+  - name: host
+    hostPath:
+      path: /
+EOF
+
+  kubectl -n kube-system wait pod "$pod" --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s >/dev/null 2>&1
+  result=$(kubectl -n kube-system logs "$pod" 2>/dev/null | tail -1)
+  kubectl -n kube-system delete pod "$pod" --wait=false >/dev/null 2>&1
+
+  [ -n "$result" ] || return 1
+  printf '%s\n' "$result"
+}
+
+task_disable_selinuxfs() {
+  log "Task 2/8: disable_selinuxfs"
+  if [ "$SKIP_SELINUX_FIX" = "true" ]; then
+    info "skipped, SKIP_SELINUX_FIX=true"
+    return 0
+  fi
+
+  local node result changed=0
+  for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+    result=$(fix_selinuxfs_on_node "$node") || fail "SELinux check failed on ${node}, check: kubectl -n kube-system describe pod kubevirt-selinux-fix-${node}"
+    case "$result" in
+      unmounted)     info "${node}: selinuxfs mounted with no policy loaded, unmounted it"; changed=1 ;;
+      not-mounted)   info "${node}: selinuxfs not mounted, nothing to do" ;;
+      policy-loaded) info "${node}: real SELinux policy loaded, left as is" ;;
+      *)             fail "unexpected result on ${node}: ${result}" ;;
+    esac
+  done
+
+  # virt-handler may have started while selinuxfs was still mounted.
+  if [ "$changed" -eq 1 ] && kubectl -n kubevirt get ds virt-handler >/dev/null 2>&1; then
+    info "restarting virt-handler so it picks up the change"
+    kubectl -n kubevirt rollout restart ds/virt-handler >/dev/null
+    kubectl -n kubevirt rollout status ds/virt-handler --timeout=300s >/dev/null \
+      || fail "virt-handler did not restart, check: kubectl -n kubevirt get pods -l kubevirt.io=virt-handler"
+  fi
+}
+
 task_label_nodes() {
-  log "Task 2/7: label_nodes"
+  log "Task 3/8: label_nodes"
   local nodes="$KUBEVIRT_NODES"
 
   if [ -z "$nodes" ]; then
@@ -96,7 +188,7 @@ task_label_nodes() {
 }
 
 task_install_operator() {
-  log "Task 3/7: install_operator"
+  log "Task 4/8: install_operator"
   # Server-side apply: the KubeVirt CRDs are too large for client-side apply annotations,
   # and unlike "kubectl create" it can run again without AlreadyExists errors.
   kubectl apply --server-side --force-conflicts -f "${MANIFEST_DIR}/kubevirt-operator.yaml" >/dev/null \
@@ -107,7 +199,7 @@ task_install_operator() {
 }
 
 task_install_kubevirt() {
-  log "Task 4/7: install_kubevirt"
+  log "Task 5/8: install_kubevirt"
   kubectl apply --server-side --force-conflicts -f "${MANIFEST_DIR}/kubevirt-cr.yaml" >/dev/null \
     || fail "applying kubevirt-cr.yaml failed"
   info "KubeVirt CR applied, waiting up to ${WAIT_TIMEOUT}s for Available"
@@ -142,7 +234,7 @@ emulation_enabled() {
 }
 
 task_configure_emulation() {
-  log "Task 5/7: configure_emulation"
+  log "Task 6/8: configure_emulation"
 
   if emulation_enabled; then
     info "useEmulation is already true, nothing to do"
@@ -168,7 +260,7 @@ task_configure_emulation() {
 }
 
 task_install_virtctl() {
-  log "Task 6/7: install_virtctl"
+  log "Task 7/8: install_virtctl"
   local version os arch target
 
   version=$(kubectl -n kubevirt get kubevirt kubevirt -o jsonpath='{.status.observedKubeVirtVersion}')
@@ -202,7 +294,7 @@ task_install_virtctl() {
 }
 
 task_create_test_vm() {
-  log "Task 7/7: create_test_vm"
+  log "Task 8/8: create_test_vm"
   if [ "$CREATE_TEST_VM" != "true" ]; then
     info "skipped, set CREATE_TEST_VM=true to run it"
     return 0
@@ -219,6 +311,7 @@ task_create_test_vm() {
 main() {
   preflight
   task_wait_for_nodes
+  task_disable_selinuxfs
   task_label_nodes
   task_install_operator
   task_install_kubevirt
